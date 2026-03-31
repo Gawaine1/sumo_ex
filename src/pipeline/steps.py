@@ -52,6 +52,19 @@ def step_3_init_random_policies(dqn: DqnModule, *, num_agents: int) -> list[Any]
     return policies
 
 
+def step_3_init_astar_inputs(*, num_agents: int) -> list[Any]:
+    """
+    当前主流程第 3 步：
+    3. 初始化纯 A* 仿真的占位输入。
+
+    说明：
+    - 主流程已移除 DQN 训练/调用；
+    - 对 SUMO 示例环境而言，传入 [None] * N 会触发“纯 A*”路径规划分支；
+    - 后续评估阶段会直接把奖励 R 传入环境，由环境执行“R + 纯 A*”仿真。
+    """
+    return [None] * int(num_agents)
+
+
 def step_3_4_load_initial_population(population_path: str) -> Population:
     """
     从缓存文件读取初始种群。
@@ -150,6 +163,25 @@ def step_4_2_generate_reward(diffusion: DiffusionModel, tau: Any) -> Any:
     """
     rewards = diffusion.generate_reward(tau)
     return rewards
+
+
+def step_4_3_simulate_and_compute_rho(
+    env: Environment,
+    rewards: Any,
+    *,
+    q: Any,
+    metric: Metric,
+) -> tuple[Any, float]:
+    """
+    当前主流程第 4.3 步：
+    4.3 直接使用奖励 R + 纯 A* 进行仿真，并计算 rho。
+    """
+    simulation_data = env.simulate_evaluate(rewards)
+    _append_simulation_data_to_csv(simulation_data)
+    print(f"仿真数据: {simulation_data}")
+    print(f"Q 数据: {q}")
+    rho = metric.compute_rho(q, simulation_data)
+    return simulation_data, float(rho)
 
 
 def step_4_3_build_dqn_training_data(dqn: DqnModule, experience_buffers: list[list[Any]], rewards: Any) -> Any:
@@ -276,6 +308,36 @@ def step_5_3_1_truncated_diffusion_mutate_reward(
     return mutated_rewards
 
 
+def step_5_3_2_simulate_collect(env: Environment, rewards: Any) -> tuple[list[list[Any]], Any]:
+    """
+    当前主流程第 5.3.2 步：
+    5.3.2 使用变异后的奖励 R' + 纯 A* 仿真，收集新的经验库与 Tau。
+    """
+    return env.simulate_collect(rewards)
+
+
+def step_5_3_3_generate_reward(diffusion: DiffusionModel, tau: Any) -> Any:
+    """
+    当前主流程第 5.3.3 步：
+    5.3.3 根据新的 Tau 再生成奖励 R。
+    """
+    return step_4_2_generate_reward(diffusion, tau)
+
+
+def step_5_3_4_simulate_and_compute_rho(
+    env: Environment,
+    rewards: Any,
+    *,
+    q: Any,
+    metric: Metric,
+) -> tuple[Any, float]:
+    """
+    当前主流程第 5.3.4 步：
+    5.3.4 使用新的奖励 R + 纯 A* 仿真，并计算 rho。
+    """
+    return step_4_3_simulate_and_compute_rho(env, rewards, q=q, metric=metric)
+
+
 def step_5_3_2_build_dqn_training_data(dqn: DqnModule, experience_buffers: list[list[Any]], rewards: Any) -> Any:
     """
     主流程第 5.3.2 步：
@@ -386,7 +448,6 @@ def step_5_6_record_best_rho(population: Population, *, iteration_k: int, csv_pa
 
 def step_6_simulate_best_and_export_routes(
     env: Environment,
-    dqn: DqnModule,
     population: Population,
     *,
     output_rou_path: str,
@@ -394,8 +455,7 @@ def step_6_simulate_best_and_export_routes(
     """
     主流程第 6 步：
     - 从最终种群中选取 ρ 最高的个体
-    - 根据该个体保存的 experience_buffers + rewards 重建训练数据并重新训练策略
-    - 用“最优个体对应的全部策略”再仿真一次
+    - 直接使用最优个体对应的奖励 R + 纯 A* 再仿真一次
     - 记录所有车辆完成路径规划后的路径，并导出一个新的 rou 文件到 outputs
 
     兼容性说明：
@@ -410,10 +470,7 @@ def step_6_simulate_best_and_export_routes(
         return population, None
 
     best_individual = max(population, key=lambda ind: float(ind.rho))
-    training_data = dqn.build_training_data(best_individual.experience_buffers, best_individual.rewards)
-    best_policies = dqn.train_per_agent(training_data)
-
-    output_path = str(export_fn(best_policies, output_rou_path=output_rou_path))
+    output_path = str(export_fn(best_individual.rewards, output_rou_path=output_rou_path))
     best_individual.metadata["step_6_exported_rou_path"] = output_path
     return population, output_path
 

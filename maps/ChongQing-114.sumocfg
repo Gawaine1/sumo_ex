@@ -6,8 +6,5 @@
         <route-files value="ChongQing-114.rou.xml" />
         <!-- <route-files value="ChongQing_NEW2023-07-01.rou.xml" /> -->
     </input>
-    <vehicles>
-        <vType id="car" maxSpeed="100"/>
-    </vehicles>
 
 </configuration>

@@ -5,8 +5,5 @@
         <net-file value="testsumo.net.xml" />
         <route-files value="testsumo.rou.xml" />
     </input>
-    <vehicles>
-        <vType id="car" maxSpeed="100"/>
-    </vehicles>
 
 </configuration>

@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src.config.schema import MasDiffConfig
-from src.dqn.base import DqnModule
 from src.diffusion.base import DiffusionModel
 from src.environments.base import Environment
 from src.evolution.base import EliteSelector
@@ -24,23 +23,17 @@ from src.pipeline.steps import (
     step_2_init_diffusion_model,
     step_3_4_try_load_initial_population,
     step_3_4_save_initial_population,
-    step_3_init_random_policies,
+    step_3_init_astar_inputs,
     step_4_1_simulate_collect,
     step_4_2_generate_reward,
-    step_4_3_build_dqn_training_data,
-    step_4_4_train_dqn_per_agent,
-    step_4_5_simulate_and_compute_rho,
+    step_4_3_simulate_and_compute_rho,
     step_4_build_individual,
     step_5_1_train_diffusion_with_population,
     step_5_2_select_elite_population,
     step_5_3_1_truncated_diffusion_mutate_reward,
-    step_5_3_2_build_dqn_training_data,
-    step_5_3_3_train_dqn_per_agent,
-    step_5_3_4_simulate_collect,
-    step_5_3_5_generate_reward,
-    step_5_3_6_build_dqn_training_data,
-    step_5_3_7_train_dqn_per_agent,
-    step_5_3_8_simulate_and_compute_rho,
+    step_5_3_2_simulate_collect,
+    step_5_3_3_generate_reward,
+    step_5_3_4_simulate_and_compute_rho,
     step_5_4_add_mutants_to_population,
     step_5_5_keep_top_m,
     step_5_6_record_best_rho,
@@ -170,7 +163,6 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
     _t0 = time.perf_counter()
     q_provider = instantiate(cfg.q_provider)
     environment = instantiate(cfg.environment)
-    dqn_module = instantiate(cfg.dqn_module)
     diffusion_model = instantiate(cfg.diffusion_model)
     elite_selector = instantiate(cfg.elite_selector)
     metric = instantiate(cfg.metric)
@@ -179,7 +171,6 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
 
     _ensure_instance(q_provider, QProvider, name="q_provider")
     _ensure_instance(environment, Environment, name="environment")
-    _ensure_instance(dqn_module, DqnModule, name="dqn_module")
     _ensure_instance(diffusion_model, DiffusionModel, name="diffusion_model")
     _ensure_instance(elite_selector, EliteSelector, name="elite_selector")
     _ensure_instance(metric, Metric, name="metric")
@@ -246,7 +237,6 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
                             "q_ref": q_ref,
                             "diffusion_state_ref": diffusion_state_ref,
                             "environment_spec": cfg.environment,
-                            "dqn_module_spec": cfg.dqn_module,
                             "diffusion_model_spec": cfg.diffusion_model,
                             "metric_spec": cfg.metric,
                         }
@@ -254,25 +244,19 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
                 population = executor.map(ray_build_initial_individual, tasks)
             else:
                 def build_initial_individual(i: int) -> Individual:
-                    # 3. 随机初始化策略（dqn），数量：M*N（这里为第 i 个个体初始化 N 个智能体策略）
-                    init_policies = step_3_init_random_policies(dqn_module, num_agents=N)
+                    # 3. 初始化纯 A* 仿真的占位输入
+                    astar_inputs = step_3_init_astar_inputs(num_agents=N)
 
-                    # 4.1 用随机初始化策略仿真一次，收集经验库与 Tau（奖励留空）
-                    experience_buffers, tau = step_4_1_simulate_collect(environment, init_policies)
+                    # 4.1 用纯 A* 仿真一次，收集经验库与 Tau
+                    experience_buffers, tau = step_4_1_simulate_collect(environment, astar_inputs)
 
                     # 4.2 把 Tau 作为扩散模型的条件生成奖励 R
                     rewards = step_4_2_generate_reward(diffusion_model, tau)
 
-                    # 4.3 将经验库和 R 合并形成 dqn 训练数据（用 rewards 填充经验中的 r）
-                    training_data = step_4_3_build_dqn_training_data(dqn_module, experience_buffers, rewards)
-
-                    # 4.4 为每个智能体训练一个 dqn
-                    trained_policies = step_4_4_train_dqn_per_agent(dqn_module, training_data)
-
-                    # 4.5 再用训练好的 dqn 仿真一次，得到仿真数据，计算 rho
-                    simulation_data, rho = step_4_5_simulate_and_compute_rho(
+                    # 4.3 直接使用 R + 纯 A* 仿真并计算 rho
+                    simulation_data, rho = step_4_3_simulate_and_compute_rho(
                         environment,
-                        trained_policies,
+                        rewards,
                         q=q,
                         metric=metric,
                     )
@@ -317,8 +301,8 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
             _add_timing_row(scope="iter", iteration_k=k, part="5.2", name="选择精英种群", duration_s=time.perf_counter() - _t52)
 
             # 5.3 遍历精英种群（留出并行处理接口）
-            # 注意：该步骤会对每个精英个体执行多步操作（5.3.1~5.3.8），为避免刷屏只在外层打印一次
-            print("5.3 遍历精英种群并生成变异个体（5.3.1~5.3.8）")
+            # 注意：该步骤会对每个精英个体执行多步操作（5.3.1~5.3.4），为避免刷屏只在外层打印一次
+            print("5.3 遍历精英种群并生成变异个体（5.3.1~5.3.4）")
             _t53 = time.perf_counter()
             if (RayExecutor is not None) and isinstance(executor, RayExecutor):
                 import ray  # type: ignore
@@ -345,7 +329,6 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
                                 "denoise_steps": int(cfg.truncated_diffusion.denoise_steps),
                             },
                             "environment_spec": cfg.environment,
-                            "dqn_module_spec": cfg.dqn_module,
                             "diffusion_model_spec": cfg.diffusion_model,
                             "metric_spec": cfg.metric,
                         }
@@ -366,49 +349,28 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
                     )
                     _tim["5.3.1"] = time.perf_counter() - _t
 
-                    # 5.3.2 将“精英个体保存的经验库”与变异奖励合并形成训练数据
+                    # 5.3.2 用变异奖励 + 纯 A* 仿真，收集新的经验库与 Tau
                     _t = time.perf_counter()
-                    training_data_1 = step_5_3_2_build_dqn_training_data(
-                        dqn_module,
-                        elite.experience_buffers,
+                    experience_buffers_2, tau_2 = step_5_3_2_simulate_collect(
+                        environment,
                         mutated_rewards,
                     )
                     _tim["5.3.2"] = time.perf_counter() - _t
 
-                    # 5.3.3 为每个智能体训练一个 dqn（得到一版训练策略）
+                    # 5.3.3 把新 Tau 作为扩散条件重新生成奖励 R
                     _t = time.perf_counter()
-                    trained_policies_1 = step_5_3_3_train_dqn_per_agent(dqn_module, training_data_1)
+                    rewards_2 = step_5_3_3_generate_reward(diffusion_model, tau_2)
                     _tim["5.3.3"] = time.perf_counter() - _t
 
-                    # 5.3.4 用训练的 dqn 仿真，重新收集经验库（奖励留空）和 Tau
+                    # 5.3.4 用新奖励 + 纯 A* 仿真并计算 rho
                     _t = time.perf_counter()
-                    experience_buffers_2, tau_2 = step_5_3_4_simulate_collect(environment, trained_policies_1)
-                    _tim["5.3.4"] = time.perf_counter() - _t
-
-                    # 5.3.5 把新 Tau 作为扩散条件生成奖励 R
-                    _t = time.perf_counter()
-                    rewards_2 = step_5_3_5_generate_reward(diffusion_model, tau_2)
-                    _tim["5.3.5"] = time.perf_counter() - _t
-
-                    # 5.3.6 将新经验库和新奖励合并形成训练数据
-                    _t = time.perf_counter()
-                    training_data_2 = step_5_3_6_build_dqn_training_data(dqn_module, experience_buffers_2, rewards_2)
-                    _tim["5.3.6"] = time.perf_counter() - _t
-
-                    # 5.3.7 再训练每个智能体的 dqn（得到最终策略）
-                    _t = time.perf_counter()
-                    trained_policies_2 = step_5_3_7_train_dqn_per_agent(dqn_module, training_data_2)
-                    _tim["5.3.7"] = time.perf_counter() - _t
-
-                    # 5.3.8 用最终策略仿真并计算 ρ
-                    _t = time.perf_counter()
-                    simulation_data_2, rho_2 = step_5_3_8_simulate_and_compute_rho(
+                    simulation_data_2, rho_2 = step_5_3_4_simulate_and_compute_rho(
                         environment,
-                        trained_policies_2,
+                        rewards_2,
                         q=q,
                         metric=metric,
                     )
-                    _tim["5.3.8"] = time.perf_counter() - _t
+                    _tim["5.3.4"] = time.perf_counter() - _t
 
                     # 形成变异后的精英个体（Tau，对应的 R，ρ）
                     _mut_total = time.perf_counter() - _t_mut_total
@@ -456,7 +418,7 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
                     duration_s=total_mean,
                     count=cnt,
                 )
-                for sub in ["5.3.1", "5.3.2", "5.3.3", "5.3.4", "5.3.5", "5.3.6", "5.3.7", "5.3.8"]:
+                for sub in ["5.3.1", "5.3.2", "5.3.3", "5.3.4"]:
                     sub_sum = sum(float(t.get(sub, 0.0)) for t in mut_timings)
                     sub_mean = sub_sum / cnt if cnt else 0.0
                     _add_timing_row(
@@ -510,15 +472,14 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
         _add_timing_row(scope="global", part="5", name="进化迭代总耗时（5）", duration_s=time.perf_counter() - _t5_total)
 
         # =========================
-        # 6. 用最终最优个体重建策略并再仿真一次，导出所有车辆规划路径为新的 rou 文件
+        # 6. 用最终最优个体的奖励 R + 纯 A* 再仿真一次，导出所有车辆规划路径为新的 rou 文件
         # =========================
-        print("6. 用最终最优个体重建策略并导出规划后的 rou 文件")
+        print("6. 用最终最优个体的奖励 R 导出规划后的 rou 文件")
         _t6 = time.perf_counter()
         best_rho_path = Path(cfg.logging.best_rho_csv_path)
         output_rou_path = best_rho_path.with_name(f"{best_rho_path.stem}_planned_routes_{run_id}.rou.xml")
         population, exported_rou_path = step_6_simulate_best_and_export_routes(
             environment,
-            dqn_module,
             population,
             output_rou_path=str(output_rou_path),
         )

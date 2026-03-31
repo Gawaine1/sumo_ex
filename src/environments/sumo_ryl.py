@@ -9,12 +9,12 @@ from src.environments.base import Environment
 
 class SumoRylEnvironment(Environment):
     """
-    一个基于 SUMO/TraCI 的环境实现（供 MASDiff 框架接入）。
+    一个基于 SUMO/libsumo 的环境实现（供 MASDiff 框架接入）。
 
     关键点（按你的要求）：
     - policies 是 DQN 模型列表（长度 = num_car），一辆车对应一个 policy（索引一致）
     - 仿真不再使用外部“权重矩阵”；路径代价使用 SUMO 路网长度：
-      - 使用 traci.edge.getLength(edge_id) 获取路段长度（作为 A* 的边代价）
+      - 使用 libsumo.edge.getLength(edge_id) 获取路段长度（作为 A* 的边代价）
     - Tau 是张量：
       - tau.shape == [num_car, num_road, 2]
       - 2个特征：[当前路距离终点的距离, 当前路的排队长度]
@@ -24,8 +24,9 @@ class SumoRylEnvironment(Environment):
       - simulation_data.shape == [100, num_road]（每行是一次采样时刻的全网排队长度向量）
     - 路径规划：
       - 车辆在出现时进行路径规划
-      - 若该车辆有可用 policy，则使用“DQN 选分支 + A*（按长度）补全路径”
-      - 若没有可用 policy（例如 policy=None 或不可调用），则只用 A*（按长度）
+      - 若传入的是奖励矩阵 R，则直接使用“R + 纯 A*”
+      - 若传入的是可用 policy，则沿路径逐边使用“DQN 选下一条边 + A* 启发式/回退”
+      - 若既没有奖励也没有可用 policy（例如 policy=None），则只用 A*（按长度）
     """
 
     def __init__(
@@ -42,6 +43,7 @@ class SumoRylEnvironment(Environment):
         # 设备策略：训练/存储在 CPU，但“使用 DQN 做决策”可在 GPU 上（用完再搬回 CPU）
         move_policies_to_device: bool = True,
         policy_device: str = "auto",  # auto/cpu/cuda/cuda:0...
+        reward_astar_weight: float = 1.0,
         controlled_vehicle_ids: list[str] | None = None,
         traci_label: str | None = None,
         extra_sumo_args: list[str] | None = None,
@@ -56,6 +58,7 @@ class SumoRylEnvironment(Environment):
         self.sample_interval = int(sample_interval)
         self.move_policies_to_device = bool(move_policies_to_device)
         self.policy_device = str(policy_device)
+        self.reward_astar_weight = float(reward_astar_weight)
         self.controlled_vehicle_ids = list(controlled_vehicle_ids) if controlled_vehicle_ids else None
         self.traci_label = str(traci_label) if traci_label else None
         self.extra_sumo_args = list(extra_sumo_args) if extra_sumo_args else []
@@ -94,15 +97,83 @@ class SumoRylEnvironment(Environment):
                 p.eval()
         return None
 
+    def _looks_like_reward_matrix(self, planner_input: Any) -> bool:
+        shape = getattr(planner_input, "shape", None)
+        if shape is not None:
+            try:
+                return len(shape) == 2
+            except Exception:
+                pass
+
+        if isinstance(planner_input, (list, tuple)) and len(planner_input) > 0:
+            first = planner_input[0]
+            first_shape = getattr(first, "shape", None)
+            if first_shape is not None:
+                try:
+                    return len(first_shape) == 1
+                except Exception:
+                    pass
+            return isinstance(first, (list, tuple))
+
+        return False
+
+    def _split_planner_input(self, planner_input: Any) -> tuple[list[Any], Any | None]:
+        """
+        兼容两类输入：
+        - policies: list[Any]
+        - rewards: [num_car, num_road]
+        """
+        if self._looks_like_reward_matrix(planner_input):
+            try:
+                num_car = int(len(planner_input))
+            except Exception as e:
+                raise TypeError("奖励矩阵无法解析 num_car。") from e
+            return [None] * num_car, planner_input
+
+        if isinstance(planner_input, list):
+            return planner_input, None
+        if isinstance(planner_input, tuple):
+            return list(planner_input), None
+
+        raise TypeError("planner_input 必须是策略列表，或 shape=[num_car,num_road] 的奖励矩阵。")
+
+    def _get_reward_row(self, rewards: Any | None, car_idx: int) -> Any | None:
+        if rewards is None:
+            return None
+        try:
+            return rewards[car_idx]
+        except Exception:
+            return None
+
+    def _reward_value_for_edge(self, reward_row: Any | None, edge_index: int) -> float:
+        if reward_row is None:
+            return 0.0
+        try:
+            value = reward_row[edge_index]
+        except Exception:
+            return 0.0
+
+        item = getattr(value, "item", None)
+        if callable(item):
+            try:
+                value = item()
+            except Exception:
+                pass
+
+        try:
+            return max(0.0, float(value))
+        except Exception:
+            return 0.0
+
     # -------------------------
     # Environment 接口实现
     # -------------------------
-    def simulate_collect(self, policies: list[Any]) -> tuple[list[list[Any]], Any]:
+    def simulate_collect(self, planner_input: Any) -> tuple[list[list[Any]], Any]:
         """
         用给定策略仿真一次，收集经验库与 Tau（奖励先留空）。
 
         返回：
-        - experience_buffers: list[list[experience]]，长度为 N（N = len(policies)）
+        - experience_buffers: list[list[experience]]，长度为 N（N = num_car）
           experience = [s, a, r]
           s = [当前road_id, [特征1, 特征2]]，其中特征为 [距离到终点, 当前路排队长度]
           a = 下一条路（这里使用下一条路的 index，便于 DQN 以离散动作建模）
@@ -116,6 +187,7 @@ class SumoRylEnvironment(Environment):
 
         traci_conn = self._start_sumo()
         try:
+            policies, rewards = self._split_planner_input(planner_input)
             # “使用 DQN 做决策”阶段：临时搬到 GPU（结束再搬回 CPU，满足“平常存储在 CPU 上”）
             if self.move_policies_to_device:
                 infer_dev = self._resolve_policy_device(torch)
@@ -154,6 +226,7 @@ class SumoRylEnvironment(Environment):
             dist_cache: dict[str, list[float]] = {}
             previous_vehicles: set[str] = set()
             filled_indices: set[int] = set()
+            planned_vehicle_ids: set[str] = set()
 
             tick = 0
             while tick < self.end_tick:
@@ -170,6 +243,9 @@ class SumoRylEnvironment(Environment):
                 # 2) 生成该车辆对应的经验库（奖励留空）
                 # 3) 进行一次路径规划：有 DQN 用 DQN + A*，无 DQN 只用 A*
                 for veh_id in new_vehicles:
+                    if veh_id in planned_vehicle_ids:
+                        continue
+
                     # 动态绑定（仅当没有 route_file / controlled_vehicle_ids 时使用）
                     if veh_id not in vehicle_id_to_index and dynamic_next_index < num_car:
                         vehicle_id_to_index[veh_id] = dynamic_next_index
@@ -177,6 +253,7 @@ class SumoRylEnvironment(Environment):
 
                     if veh_id not in vehicle_id_to_index:
                         continue
+                    planned_vehicle_ids.add(veh_id)
 
                     car_idx = int(vehicle_id_to_index[veh_id])
                     if not (0 <= car_idx < num_car):
@@ -219,6 +296,7 @@ class SumoRylEnvironment(Environment):
                     if start_edge and (start_edge in edge_id_to_index) and start_edge != dest_edge:
                         planned_route = self._plan_route_on_appearance(
                             policy=policies[car_idx] if car_idx < len(policies) else None,
+                            reward_row=self._get_reward_row(rewards, car_idx),
                             traci_conn=traci_conn,
                             vehicle_id=veh_id,
                             start_edge=start_edge,
@@ -244,7 +322,7 @@ class SumoRylEnvironment(Environment):
                     pass
             self._close_sumo(traci_conn)
 
-    def simulate_evaluate(self, policies: list[Any]) -> Any:
+    def simulate_evaluate(self, planner_input: Any) -> Any:
         """
         用给定策略仿真一次，返回用于评估的 simulation_data 张量。
 
@@ -258,6 +336,7 @@ class SumoRylEnvironment(Environment):
 
         traci_conn = self._start_sumo()
         try:
+            policies, rewards = self._split_planner_input(planner_input)
             if self.move_policies_to_device:
                 infer_dev = self._resolve_policy_device(torch)
                 self._maybe_move_policies(policies, infer_dev, torch)
@@ -278,6 +357,7 @@ class SumoRylEnvironment(Environment):
             point_idx = 0
 
             previous_vehicles: set[str] = set()
+            planned_vehicle_ids: set[str] = set()
 
             tick = 0
             while tick < self.end_tick:
@@ -290,11 +370,14 @@ class SumoRylEnvironment(Environment):
 
                 # 车辆出现时进行一次路径规划（评估也遵循同样规则）
                 for veh_id in new_vehicles:
+                    if veh_id in planned_vehicle_ids:
+                        continue
                     if veh_id not in vehicle_id_to_index and dynamic_next_index < num_car:
                         vehicle_id_to_index[veh_id] = dynamic_next_index
                         dynamic_next_index += 1
                     if veh_id not in vehicle_id_to_index:
                         continue
+                    planned_vehicle_ids.add(veh_id)
 
                     car_idx = int(vehicle_id_to_index[veh_id])
                     if not (0 <= car_idx < num_car):
@@ -320,6 +403,7 @@ class SumoRylEnvironment(Environment):
                     if dest_edge in dist_cache:
                         planned_route = self._plan_route_on_appearance(
                             policy=policies[car_idx] if car_idx < len(policies) else None,
+                            reward_row=self._get_reward_row(rewards, car_idx),
                             traci_conn=traci_conn,
                             vehicle_id=veh_id,
                             start_edge=start_edge,
@@ -351,13 +435,13 @@ class SumoRylEnvironment(Environment):
             self._close_sumo(traci_conn)
 
     # -------------------------
-    # SUMO/TraCI & 路网工具
+    # SUMO/libsumo & 路网工具
     # -------------------------
     def _start_sumo(self):
         try:
-            import traci  # type: ignore
+            import libsumo as traci  # type: ignore
         except Exception as e:  # pragma: no cover
-            raise ImportError("无法导入 traci。请确认已安装/配置 SUMO 的 Python 工具链。") from e
+            raise ImportError("无法导入 libsumo。请确认已安装 libsumo，并已配置 SUMO 的 Python 工具链。") from e
 
         # 尽量不依赖外部 config.py：全部由 kwargs 传入
         sumo_cfg = Path(self.sumo_config)
@@ -415,9 +499,12 @@ class SumoRylEnvironment(Environment):
             i += 1
         sumo_args = deduped
 
+        # libsumo 不支持 traci 的多连接标签模式；当前项目并行依赖多进程（如 Ray worker）隔离实例
         if self.traci_label:
-            traci.start(sumo_args, label=self.traci_label)
-            return traci.getConnection(self.traci_label)
+            raise ValueError(
+                "当前 SUMO 环境已切换为 libsumo，`traci_label` 不再可用。"
+                "如需并行，请使用多进程/多 worker 隔离实例，而不是在单进程内使用 label 多连接。"
+            )
         traci.start(sumo_args)
         return traci
 
@@ -426,7 +513,7 @@ class SumoRylEnvironment(Environment):
             if hasattr(traci_conn, "close"):
                 traci_conn.close()
             else:
-                # traci 模块级 close
+                # libsumo / traci 模块级 close
                 traci_conn.close()  # type: ignore[attr-defined]
         except Exception:
             # 避免因关闭异常影响上层流程
@@ -459,7 +546,7 @@ class SumoRylEnvironment(Environment):
             except Exception:
                 pass
 
-        # 退化：使用 traci 的 edge 列表（过滤 internal edge）
+        # 退化：使用 libsumo 的 edge 列表（过滤 internal edge）
         edge_ids = [eid for eid in list(traci_conn.edge.getIDList()) if not str(eid).startswith(":")]
         outgoing_map = {eid: [] for eid in edge_ids}
         return edge_ids, outgoing_map
@@ -475,7 +562,7 @@ class SumoRylEnvironment(Environment):
         return m
 
     def _collect_edge_length_map(self, traci_conn, edge_ids: list[str]) -> dict[str, float]:
-        # 核心：用 traci 获取路段长度
+        # 核心：用 libsumo 获取路段长度
         m: dict[str, float] = {}
         for eid in edge_ids:
             try:
@@ -593,6 +680,7 @@ class SumoRylEnvironment(Environment):
         self,
         *,
         policy: Any,
+        reward_row: Any | None,
         traci_conn: Any,
         vehicle_id: str,
         start_edge: str,
@@ -605,8 +693,9 @@ class SumoRylEnvironment(Environment):
     ) -> list[str]:
         """
         车辆出现时的路径规划：
-        - 无 policy：直接 A*（按长度）规划 start->dest
-        - 有 policy：先让 DQN 在 start 的出边中选一个 next_edge，再用 A*（按长度）补全 next_edge->dest
+        - 有 reward_row：直接走“R + 纯 A*”
+        - 无 reward_row 且无 policy：直接 A*（按长度）规划 start->dest
+        - 有 policy：不是只在 start 决策一次，而是沿路径逐边执行“DQN 选下一条边 + A* 启发式/回退”
         """
         # 只用 A*（按长度）
         def astar_only() -> list[str]:
@@ -617,46 +706,92 @@ class SumoRylEnvironment(Environment):
                 goal_edge=dest_edge,
             )
 
+        def reward_astar_only() -> list[str]:
+            return self._shortest_path_edges_by_reward_astar(
+                outgoing_map=outgoing_map,
+                edge_length_map=edge_length_map,
+                edge_id_to_index=edge_id_to_index,
+                dists_to_dest=dists_to_dest,
+                reward_row=reward_row,
+                start_edge=start_edge,
+                goal_edge=dest_edge,
+            )
+
         candidates = outgoing_map.get(start_edge, [])
         if not candidates:
-            return astar_only()
+            return reward_astar_only() if reward_row is not None else astar_only()
+
+        if reward_row is not None:
+            return reward_astar_only()
 
         # 没有可用 DQN：只用 A*
         if policy is None:
             return astar_only()
 
-        # 状态特征严格按你要求的 2 维：[距离到终点, 当前路排队长度]
-        start_i = edge_id_to_index.get(start_edge, -1)
-        if start_i < 0:
-            return astar_only()
-        state = [start_edge, [float(dists_to_dest[start_i]), float(queue_len_map.get(start_edge, 0.0))]]
+        # 逐边规划：每一步都重新基于当前 edge 做一次 DQN 选择。
+        # A* 不再只在起点后一次性补全整段路径，而是作为启发式距离/失败回退存在。
+        route = [start_edge]
+        current_edge = start_edge
+        max_hops = max(1, len(edge_id_to_index) * 2)
+        visited_edges: set[str] = {start_edge}
 
-        candidate_dists = {c: float(dists_to_dest[edge_id_to_index[c]]) for c in candidates if c in edge_id_to_index}
-        candidate_indices = [int(edge_id_to_index[c]) for c in candidates if c in edge_id_to_index]
-        chosen_next = self._select_action_next_edge(
-            policy=policy,
-            state=state,
-            vehicle_id=vehicle_id,
-            current_edge=start_edge,
-            destination_edge=dest_edge,
-            candidates=candidates,
-            candidate_dists=candidate_dists,
-            candidate_indices=candidate_indices,
-        )
+        for _ in range(max_hops):
+            if current_edge == dest_edge:
+                return route
 
-        if chosen_next not in candidates:
-            # 回退：选距离最小（按长度）
-            chosen_next = min(candidates, key=lambda e: candidate_dists.get(e, float("inf")))
+            current_candidates = list(outgoing_map.get(current_edge, []))
+            if not current_candidates:
+                break
 
+            current_i = edge_id_to_index.get(current_edge, -1)
+            if current_i < 0:
+                break
+
+            state = [current_edge, [float(dists_to_dest[current_i]), float(queue_len_map.get(current_edge, 0.0))]]
+            candidate_dists = {
+                c: float(dists_to_dest[edge_id_to_index[c]])
+                for c in current_candidates
+                if c in edge_id_to_index
+            }
+            candidate_indices = [int(edge_id_to_index[c]) for c in current_candidates if c in edge_id_to_index]
+
+            chosen_next = self._select_action_next_edge(
+                policy=policy,
+                state=state,
+                vehicle_id=vehicle_id,
+                current_edge=current_edge,
+                destination_edge=dest_edge,
+                candidates=current_candidates,
+                candidate_dists=candidate_dists,
+                candidate_indices=candidate_indices,
+            )
+
+            if chosen_next not in current_candidates:
+                chosen_next = min(current_candidates, key=lambda e: candidate_dists.get(e, float("inf")))
+
+            # 尽量避免 DQN 落入环；若出现回环，则用启发式最优且未访问的边回退。
+            if chosen_next in visited_edges:
+                non_cycle_candidates = [c for c in current_candidates if c not in visited_edges]
+                if non_cycle_candidates:
+                    chosen_next = min(non_cycle_candidates, key=lambda e: candidate_dists.get(e, float("inf")))
+
+            route.append(chosen_next)
+            current_edge = chosen_next
+            visited_edges.add(chosen_next)
+
+        if current_edge == dest_edge:
+            return route
+
+        # 若逐边决策中途失败，则仅从当前边做一次 A* 收尾，避免整条路线直接失效。
         tail = self._shortest_path_edges_by_edge_length(
             outgoing_map=outgoing_map,
             edge_length_map=edge_length_map,
-            start_edge=chosen_next,
+            start_edge=current_edge,
             goal_edge=dest_edge,
         )
-        if not tail:
-            return astar_only()
-        return [start_edge] + tail
+        if tail:
+            return route[:-1] + tail
+        return astar_only()
 
     def _select_action_next_edge(
         self,
@@ -706,6 +841,98 @@ class SumoRylEnvironment(Environment):
             if 0 <= action < len(candidates):
                 return candidates[action]
         return None
+
+    def _shortest_path_edges_by_reward_astar(
+        self,
+        *,
+        outgoing_map: dict[str, list[str]],
+        edge_length_map: dict[str, float],
+        edge_id_to_index: dict[str, int],
+        dists_to_dest: list[float],
+        reward_row: Any | None,
+        start_edge: str,
+        goal_edge: str,
+    ) -> list[str]:
+        """
+        使用奖励 R 对边代价进行重加权后，执行纯 A* 路径规划。
+
+        代价设计：
+        - 基础代价仍为路段长度；
+        - 奖励越大，有效代价越小；
+        - 始终保持正代价，避免最短路算法失效。
+        """
+        if start_edge == goal_edge:
+            return [start_edge]
+
+        import heapq
+
+        weight = max(0.0, float(self.reward_astar_weight))
+        if weight <= 0.0:
+            return self._shortest_path_edges_by_edge_length(
+                outgoing_map=outgoing_map,
+                edge_length_map=edge_length_map,
+                start_edge=start_edge,
+                goal_edge=goal_edge,
+            )
+
+        num_road = len(edge_id_to_index)
+        max_reward = 0.0
+        for edge_index in range(num_road):
+            max_reward = max(max_reward, self._reward_value_for_edge(reward_row, edge_index))
+
+        def edge_cost(edge_id: str) -> float:
+            base = float(edge_length_map.get(edge_id, 0.0))
+            if base <= 0.0:
+                base = 1.0e-6
+            edge_idx = edge_id_to_index.get(edge_id)
+            if edge_idx is None:
+                return base
+            reward_value = self._reward_value_for_edge(reward_row, edge_idx)
+            reward_ratio = (reward_value / max_reward) if max_reward > 0.0 else 0.0
+            return max(base / (1.0 + weight * reward_ratio), 1.0e-6)
+
+        def heuristic(edge_id: str) -> float:
+            edge_idx = edge_id_to_index.get(edge_id)
+            if edge_idx is None:
+                return 0.0
+            try:
+                base_dist = float(dists_to_dest[edge_idx])
+            except Exception:
+                return 0.0
+            if base_dist == float("inf"):
+                return 0.0
+            return max(base_dist / (1.0 + weight), 0.0)
+
+        INF = float("inf")
+        g_score: dict[str, float] = {start_edge: 0.0}
+        prev: dict[str, str] = {}
+        heap: list[tuple[float, float, str]] = [(heuristic(start_edge), 0.0, start_edge)]
+
+        while heap:
+            _, g_cur, u = heapq.heappop(heap)
+            if g_cur != g_score.get(u, INF):
+                continue
+            if u == goal_edge:
+                break
+            for v in outgoing_map.get(u, []):
+                nd = g_cur + edge_cost(v)
+                if nd < g_score.get(v, INF):
+                    g_score[v] = nd
+                    prev[v] = u
+                    heapq.heappush(heap, (nd + heuristic(v), nd, v))
+
+        if goal_edge not in g_score:
+            return []
+
+        path_rev = [goal_edge]
+        cur = goal_edge
+        while cur in prev:
+            cur = prev[cur]
+            path_rev.append(cur)
+        path = list(reversed(path_rev))
+        if path and path[0] == start_edge:
+            return path
+        return []
 
     def _try_set_vehicle_route(self, traci_conn, vehicle_id: str, route_edges: list[str]) -> None:
         try:

@@ -10,13 +10,13 @@ class Environment(ABC):
 
     主流程中，环境主要负责两类仿真：
     - 收集经验库 + Tau（奖励先留空）
-    - 给定策略跑一次，产出“仿真数据”（结构与 Q 相同/可对齐），用于计算 ρ
+    - 给定策略/奖励等输入跑一次，产出“仿真数据”（结构与 Q 相同/可对齐），用于计算 ρ
     """
 
     @abstractmethod
-    def simulate_collect(self, policies: list[Any]) -> tuple[list[list[Any]], Any]:
+    def simulate_collect(self, planner_input: Any) -> tuple[list[list[Any]], Any]:
         """
-        用给定策略仿真一次，收集每个智能体的经验库与 Tau。
+        用给定输入仿真一次，收集每个智能体的经验库与 Tau。
 
         返回值：
         - experience_buffers: 长度为 N 的列表；每个元素是一个经验序列。
@@ -26,9 +26,9 @@ class Environment(ABC):
         """
 
     @abstractmethod
-    def simulate_evaluate(self, policies: list[Any]) -> Any:
+    def simulate_evaluate(self, planner_input: Any) -> Any:
         """
-        用给定策略仿真一次，返回用于评估的“仿真数据”（结构建议与 Q 相同或可对齐）。
+        用给定输入仿真一次，返回用于评估的“仿真数据”（结构建议与 Q 相同或可对齐）。
 
         返回值用途：
         - 与 Q 一起输入到 metric 计算 ρ（适应度/指标，越大越好）

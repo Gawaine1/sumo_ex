@@ -5,21 +5,15 @@ from typing import Any
 
 from src.pipeline.types import Individual
 from src.pipeline.steps import (
-    step_3_init_random_policies,
+    step_3_init_astar_inputs,
     step_4_1_simulate_collect,
     step_4_2_generate_reward,
-    step_4_3_build_dqn_training_data,
-    step_4_4_train_dqn_per_agent,
-    step_4_5_simulate_and_compute_rho,
+    step_4_3_simulate_and_compute_rho,
     step_4_build_individual,
     step_5_3_1_truncated_diffusion_mutate_reward,
-    step_5_3_2_build_dqn_training_data,
-    step_5_3_3_train_dqn_per_agent,
-    step_5_3_4_simulate_collect,
-    step_5_3_5_generate_reward,
-    step_5_3_6_build_dqn_training_data,
-    step_5_3_7_train_dqn_per_agent,
-    step_5_3_8_simulate_and_compute_rho,
+    step_5_3_2_simulate_collect,
+    step_5_3_3_generate_reward,
+    step_5_3_4_simulate_and_compute_rho,
 )
 from src.utils.import_utils import ModuleSpec, instantiate
 
@@ -94,7 +88,7 @@ def build_initial_individual(task: dict[str, Any]) -> Individual:
     - seed: 可选，任务随机种子
     - q_ref: ray ObjectRef（Q 可能很大，用 object store 传）
     - diffusion_state_ref: ray ObjectRef（扩散模型参数 state_dict）
-    - environment_spec/dqn_module_spec/diffusion_model_spec/metric_spec: ModuleSpec（用于 worker 内实例化）
+    - environment_spec/diffusion_model_spec/metric_spec: ModuleSpec（用于 worker 内实例化）
     """
     _maybe_seed(task.get("seed"))
 
@@ -111,7 +105,6 @@ def build_initial_individual(task: dict[str, Any]) -> Individual:
 
     # 注意：这里刻意复用 steps.py 的函数，以确保 Ray 并行路径与 runner.py 串行路径语义一致。
     env = instantiate(task["environment_spec"])
-    dqn = instantiate(task["dqn_module_spec"])
     diffusion = instantiate(task["diffusion_model_spec"])
     metric = instantiate(task["metric_spec"])
 
@@ -120,23 +113,17 @@ def build_initial_individual(task: dict[str, Any]) -> Individual:
     # =========================
     # 3-4. 构建初始个体（对应 runner.py 的 build_initial_individual）
     # =========================
-    # 3) 随机初始化策略（DQN），为该个体初始化 N 个智能体策略
-    init_policies = step_3_init_random_policies(dqn, num_agents=N)
+    # 3) 初始化纯 A* 仿真的占位输入
+    astar_inputs = step_3_init_astar_inputs(num_agents=N)
 
-    # 4.1) 用随机策略仿真一次，收集经验库与 Tau（奖励留空）
-    experience_buffers, tau = step_4_1_simulate_collect(env, init_policies)
+    # 4.1) 用纯 A* 仿真一次，收集经验库与 Tau
+    experience_buffers, tau = step_4_1_simulate_collect(env, astar_inputs)
 
     # 4.2) 把 Tau 作为扩散模型条件生成奖励 R
     rewards = step_4_2_generate_reward(diffusion, tau)
 
-    # 4.3) 将经验库与 R 合并形成 DQN 训练数据（用 rewards 填充经验中的 r）
-    training_data = step_4_3_build_dqn_training_data(dqn, experience_buffers, rewards)
-
-    # 4.4) 为每个智能体训练一个 DQN（得到策略列表）
-    trained_policies = step_4_4_train_dqn_per_agent(dqn, training_data)
-
-    # 4.5) 用训练好的策略再仿真一次，得到 simulation_data 并计算 ρ
-    simulation_data, rho = step_4_5_simulate_and_compute_rho(env, trained_policies, q=q, metric=metric)
+    # 4.3) 直接使用 R + 纯 A* 再仿真一次，得到 simulation_data 并计算 ρ
+    simulation_data, rho = step_4_3_simulate_and_compute_rho(env, rewards, q=q, metric=metric)
 
     # 关键：不要把 policies 放进 Individual（巨大且后续未使用，会导致 Ray/内存爆炸）
     ind = step_4_build_individual(
@@ -162,7 +149,7 @@ def mutate_one(task: dict[str, Any]) -> Individual:
     - q_ref: ray ObjectRef
     - diffusion_state_ref: ray ObjectRef（当前迭代训练后的扩散参数）
     - truncated_diffusion: dict(add_noise_steps, denoise_steps)
-    - environment_spec/dqn_module_spec/diffusion_model_spec/metric_spec: ModuleSpec
+    - environment_spec/diffusion_model_spec/metric_spec: ModuleSpec
     """
     _maybe_seed(task.get("seed"))
 
@@ -181,7 +168,6 @@ def mutate_one(task: dict[str, Any]) -> Individual:
     diffusion_state = ray.get(task["diffusion_state_ref"])
 
     env = instantiate(task["environment_spec"])
-    dqn = instantiate(task["dqn_module_spec"])
     diffusion = instantiate(task["diffusion_model_spec"])
     metric = instantiate(task["metric_spec"])
     load_diffusion_state(diffusion, diffusion_state)
@@ -198,26 +184,14 @@ def mutate_one(task: dict[str, Any]) -> Individual:
         denoise_steps=denoise_steps,
     )
 
-    # 5.3.2) 用“精英个体保存的经验库”与变异奖励合并形成训练数据
-    training_data_1 = step_5_3_2_build_dqn_training_data(dqn, elite.experience_buffers, mutated_rewards)
+    # 5.3.2) 用变异奖励 R' + 纯 A* 仿真，重新收集经验库与 Tau
+    experience_buffers_2, tau_2 = step_5_3_2_simulate_collect(env, mutated_rewards)
 
-    # 5.3.3) 为每个智能体训练一个 DQN（得到一版策略）
-    trained_policies_1 = step_5_3_3_train_dqn_per_agent(dqn, training_data_1)
+    # 5.3.3) 把新 Tau 作为条件重新生成奖励 R
+    rewards_2 = step_5_3_3_generate_reward(diffusion, tau_2)
 
-    # 5.3.4) 用该策略仿真，重新收集经验库（奖励留空）与新的 Tau
-    experience_buffers_2, tau_2 = step_5_3_4_simulate_collect(env, trained_policies_1)
-
-    # 5.3.5) 把新 Tau 作为条件生成奖励 R
-    rewards_2 = step_5_3_5_generate_reward(diffusion, tau_2)
-
-    # 5.3.6) 将新经验库与新奖励合并形成训练数据
-    training_data_2 = step_5_3_6_build_dqn_training_data(dqn, experience_buffers_2, rewards_2)
-
-    # 5.3.7) 再训练每个智能体的 DQN（得到最终策略）
-    trained_policies_2 = step_5_3_7_train_dqn_per_agent(dqn, training_data_2)
-
-    # 5.3.8) 用最终策略仿真并计算 ρ
-    simulation_data_2, rho_2 = step_5_3_8_simulate_and_compute_rho(env, trained_policies_2, q=q, metric=metric)
+    # 5.3.4) 用新奖励 R + 纯 A* 仿真并计算 ρ
+    simulation_data_2, rho_2 = step_5_3_4_simulate_and_compute_rho(env, rewards_2, q=q, metric=metric)
 
     # 汇总形成变异个体（同样不保存 policies，避免巨大对象在 Ray 中传输/落盘）
     mutant = step_4_build_individual(
