@@ -23,7 +23,7 @@ from src.pipeline.steps import (
     step_2_init_diffusion_model,
     step_3_4_try_load_initial_population,
     step_3_4_save_initial_population,
-    step_3_init_astar_inputs,
+    step_3_init_random_rewards,
     step_4_1_simulate_collect,
     step_4_2_generate_reward,
     step_4_3_simulate_and_compute_rho,
@@ -244,11 +244,16 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
                 population = executor.map(ray_build_initial_individual, tasks)
             else:
                 def build_initial_individual(i: int) -> Individual:
-                    # 3. 初始化纯 A* 仿真的占位输入
-                    astar_inputs = step_3_init_astar_inputs(num_agents=N)
+                    # 3. 随机初始化初始奖励矩阵 R（范围 [0,5]）
+                    initial_rewards = step_3_init_random_rewards(
+                        q=q,
+                        num_agents=N,
+                        reward_min=0.0,
+                        reward_max=5.0,
+                    )
 
-                    # 4.1 用纯 A* 仿真一次，收集经验库与 Tau
-                    experience_buffers, tau = step_4_1_simulate_collect(environment, astar_inputs)
+                    # 4.1 用随机 R + A* 仿真一次，收集经验库与 Tau
+                    experience_buffers, tau = step_4_1_simulate_collect(environment, initial_rewards)
 
                     # 4.2 把 Tau 作为扩散模型的条件生成奖励 R
                     rewards = step_4_2_generate_reward(diffusion_model, tau)

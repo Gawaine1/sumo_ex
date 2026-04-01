@@ -65,6 +65,58 @@ def step_3_init_astar_inputs(*, num_agents: int) -> list[Any]:
     return [None] * int(num_agents)
 
 
+def step_3_init_random_rewards(
+    *,
+    q: Any,
+    num_agents: int,
+    reward_min: float = 0.0,
+    reward_max: float = 5.0,
+) -> Any:
+    """
+    当前主流程第 3 步：
+    3. 随机初始化初始奖励矩阵 R，并在首次仿真时走 “R + A*” 分支。
+
+    说明：
+    - 奖励矩阵形状为 [num_agents, num_road]；
+    - num_road 直接从 q 的最后一维推断，保证与评估数据维度一致；
+    - 默认随机范围为 [0, 5]。
+    """
+    num_car = int(num_agents)
+    if num_car <= 0:
+        raise ValueError("num_agents 必须 > 0")
+
+    q_shape = getattr(q, "shape", None)
+    num_road: int | None = None
+    if q_shape is not None and len(q_shape) >= 1:
+        num_road = int(q_shape[-1])
+    elif isinstance(q, (list, tuple)) and len(q) > 0:
+        last = q[-1]
+        if isinstance(last, (list, tuple)) and len(last) > 0:
+            num_road = int(len(last))
+        else:
+            num_road = int(len(q))
+
+    if num_road is None:
+        raise ValueError("无法从 q 推断 num_road：q 缺少有效 shape")
+
+    if num_road <= 0:
+        raise ValueError("无法从 q 推断 num_road：最后一维必须 > 0")
+
+    lo = float(reward_min)
+    hi = float(reward_max)
+    if hi < lo:
+        raise ValueError("reward_max 必须 >= reward_min")
+
+    try:
+        import torch  # type: ignore
+
+        return torch.rand((num_car, num_road), dtype=torch.float32) * (hi - lo) + lo
+    except Exception:
+        import random
+
+        return [[random.uniform(lo, hi) for _ in range(num_road)] for _ in range(num_car)]
+
+
 def step_3_4_load_initial_population(population_path: str) -> Population:
     """
     从缓存文件读取初始种群。
@@ -147,12 +199,12 @@ def _to_jsonable(value: Any) -> Any:
 # =========================
 # 4. 形成初始种群：单个个体的构建步骤
 # =========================
-def step_4_1_simulate_collect(env: Environment, policies: list[Any]) -> tuple[list[list[Any]], Any]:
+def step_4_1_simulate_collect(env: Environment, planner_input: Any) -> tuple[list[list[Any]], Any]:
     """
     主流程第 4.1 步：
-    4.1 用随机初始化策略（dqn）仿真一次，收集每个智能体的经验库（奖励留空）和 Tau
+    4.1 用给定规划输入仿真一次，收集每个智能体的经验库（奖励留空）和 Tau
     """
-    experience_buffers, tau = env.simulate_collect(policies)
+    experience_buffers, tau = env.simulate_collect(planner_input)
     return experience_buffers, tau
 
 

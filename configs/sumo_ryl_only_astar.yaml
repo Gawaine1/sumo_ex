@@ -49,7 +49,7 @@ environment:
     policy_device: "cpu"   # auto/cpu/cuda/cuda:0...
 
     # R + 纯Astar 路径规划的奖励影响权重
-    reward_astar_weight: 1.0
+    reward_astar_weight: 10.0
 
     # --- vehicle 绑定方式（三选一，优先级：controlled_vehicle_ids > route_file > 运行时 vehicle.getIDList）---
     # controlled_vehicle_ids:

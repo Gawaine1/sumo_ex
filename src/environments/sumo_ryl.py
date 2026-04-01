@@ -857,9 +857,9 @@ class SumoRylEnvironment(Environment):
         使用奖励 R 对边代价进行重加权后，执行纯 A* 路径规划。
 
         代价设计：
-        - 基础代价仍为路段长度；
-        - 奖励越大，有效代价越小；
-        - 始终保持正代价，避免最短路算法失效。
+        - 先将路段长度按“全网平均边长”归一化，避免绝对长度过大压制奖励；
+        - 再叠加一个由奖励决定的非负惩罚项：reward 越大，惩罚越小；
+        - 整体代价始终为正，且 heuristic 仍可安全使用“纯长度下界”。
         """
         if start_edge == goal_edge:
             return [start_edge]
@@ -876,9 +876,18 @@ class SumoRylEnvironment(Environment):
             )
 
         num_road = len(edge_id_to_index)
-        max_reward = 0.0
-        for edge_index in range(num_road):
-            max_reward = max(max_reward, self._reward_value_for_edge(reward_row, edge_index))
+        reward_values = [self._reward_value_for_edge(reward_row, edge_index) for edge_index in range(num_road)]
+        max_reward = max(reward_values) if reward_values else 0.0
+        min_reward = min(reward_values) if reward_values else 0.0
+        reward_span = max_reward - min_reward
+
+        positive_lengths = [float(v) for v in edge_length_map.values() if float(v) > 0.0]
+        mean_edge_length = (
+            sum(positive_lengths) / float(len(positive_lengths))
+            if positive_lengths
+            else 1.0
+        )
+        mean_edge_length = max(mean_edge_length, 1.0e-6)
 
         def edge_cost(edge_id: str) -> float:
             base = float(edge_length_map.get(edge_id, 0.0))
@@ -886,10 +895,16 @@ class SumoRylEnvironment(Environment):
                 base = 1.0e-6
             edge_idx = edge_id_to_index.get(edge_id)
             if edge_idx is None:
-                return base
+                return max(base / mean_edge_length, 1.0e-6)
             reward_value = self._reward_value_for_edge(reward_row, edge_idx)
-            reward_ratio = (reward_value / max_reward) if max_reward > 0.0 else 0.0
-            return max(base / (1.0 + weight * reward_ratio), 1.0e-6)
+            if reward_span > 1.0e-12:
+                reward_ratio = (reward_value - min_reward) / reward_span
+            else:
+                reward_ratio = (reward_value / max_reward) if max_reward > 1.0e-12 else 0.0
+
+            normalized_length = base / mean_edge_length
+            reward_penalty = weight * (1.0 - reward_ratio)
+            return max(normalized_length + reward_penalty, 1.0e-6)
 
         def heuristic(edge_id: str) -> float:
             edge_idx = edge_id_to_index.get(edge_id)
@@ -901,7 +916,7 @@ class SumoRylEnvironment(Environment):
                 return 0.0
             if base_dist == float("inf"):
                 return 0.0
-            return max(base_dist / (1.0 + weight), 0.0)
+            return max(base_dist / mean_edge_length, 0.0)
 
         INF = float("inf")
         g_score: dict[str, float] = {start_edge: 0.0}
