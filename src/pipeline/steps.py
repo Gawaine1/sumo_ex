@@ -274,6 +274,24 @@ def _append_simulation_data_to_csv(simulation_data: Any, csv_path: str = "output
         writer.writerow([json.dumps(_to_jsonable(simulation_data), ensure_ascii=False)])
 
 
+def _overwrite_simulation_data_csv(simulation_data: Any, csv_path: str) -> None:
+    """
+    覆盖写入单个 simulation_data 到 CSV 文件。
+
+    输出格式与 outputs/simulation_data.csv 保持一致：
+    - 仅包含一列表头 simulation_data
+    - 第二行写入一条 JSON 字符串
+    """
+    p = Path(csv_path)
+    if p.parent != Path("."):
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+    with p.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["simulation_data"])
+        writer.writerow([json.dumps(_to_jsonable(simulation_data), ensure_ascii=False)])
+
+
 def step_4_5_simulate_and_compute_rho(
     env: Environment,
     policies: list[Any],
@@ -496,6 +514,37 @@ def step_5_6_record_best_rho(population: Population, *, iteration_k: int, csv_pa
         writer.writerow([iteration_k, best_rho])
 
     return population, best_rho
+
+
+def step_record_best_simulation_data_if_improved(
+    population: Population,
+    *,
+    csv_path: str,
+    best_rho_so_far: float | None = None,
+) -> tuple[Population, float, bool]:
+    """
+    将“当前全局最优个体”的 simulation_data 覆盖写入额外的 CSV 文件。
+
+    规则：
+    - 若当前种群中的最优个体优于 best_rho_so_far，则覆盖写入 csv_path；
+    - 若没有更优个体出现，则不改动该文件；
+    - 返回更新后的全局最优 rho，以及本次是否发生覆盖写入。
+    """
+    if len(population) == 0:
+        raise ValueError("population 不能为空，无法记录最优 simulation_data")
+
+    best_individual = max(population, key=lambda ind: float(ind.rho))
+    best_rho = float(best_individual.rho)
+
+    if best_rho_so_far is not None and best_rho <= float(best_rho_so_far):
+        return population, float(best_rho_so_far), False
+
+    simulation_data = getattr(best_individual, "metadata", {}).get("simulation_data")
+    if simulation_data is None:
+        raise ValueError("最优个体缺少 metadata['simulation_data']，无法写入最优 simulation_data CSV")
+
+    _overwrite_simulation_data_csv(simulation_data, csv_path)
+    return population, best_rho, True
 
 
 def step_6_simulate_best_and_export_routes(

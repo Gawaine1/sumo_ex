@@ -37,6 +37,7 @@ from src.pipeline.steps import (
     step_5_4_add_mutants_to_population,
     step_5_5_keep_top_m,
     step_5_6_record_best_rho,
+    step_record_best_simulation_data_if_improved,
     step_6_simulate_best_and_export_routes,
 )
 from src.pipeline.types import Individual, Population
@@ -180,6 +181,9 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
     N = cfg.algorithm.N
     K = cfg.algorithm.K
     initial_population_path = cfg.logging.initial_population_path
+    best_rho_path = Path(cfg.logging.best_rho_csv_path)
+    best_simulation_data_csv_path = best_rho_path.with_name(f"{best_rho_path.stem}_best_simulation_data.csv")
+    global_best_rho: float | None = None
     cached_initial_population = step_3_4_try_load_initial_population(initial_population_path)
 
     if cached_initial_population is not None:
@@ -285,6 +289,14 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
                 print(f"初始种群已保存到：{initial_population_path}")
         _add_timing_row(scope="global", part="3-4", name="构建初始种群（3-4）", duration_s=time.perf_counter() - _t34)
         print("4. 初始种群构建完成")
+
+        population, global_best_rho, wrote_best_simulation_data = step_record_best_simulation_data_if_improved(
+            population,
+            csv_path=str(best_simulation_data_csv_path),
+            best_rho_so_far=global_best_rho,
+        )
+        if wrote_best_simulation_data:
+            print(f"4. 已初始化最优个体 simulation_data CSV：{best_simulation_data_csv_path}")
 
         # =========================
         # 5. for k = 1..K 进化迭代
@@ -465,6 +477,14 @@ def run_masdiff(cfg: MasDiffConfig) -> Population:
             )
             _add_timing_row(scope="iter", iteration_k=k, part="5.6", name="记录最优 ρ 到 CSV", duration_s=time.perf_counter() - _t56)
             print(f"    本次迭代最优 ρ = {best_rho_k}")
+
+            population, global_best_rho, wrote_best_simulation_data = step_record_best_simulation_data_if_improved(
+                population,
+                csv_path=str(best_simulation_data_csv_path),
+                best_rho_so_far=global_best_rho,
+            )
+            if wrote_best_simulation_data:
+                print(f"    检测到新的全局最优个体，已覆盖写入：{best_simulation_data_csv_path}")
 
             _add_timing_row(
                 scope="iter",
