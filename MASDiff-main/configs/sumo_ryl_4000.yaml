@@ -1,0 +1,156 @@
+# SUMO 环境接入示例（一套模块一个 yaml）
+# 注意：该配置只是示例占位；你需要把 sumo_config/net_file/route_file 等路径改成你的实际文件。
+
+seed: 42
+
+algorithm:
+  M: 100
+  N: 4000
+  K: 1
+
+elite:
+  elite_count: 20
+
+truncated_diffusion:
+  add_noise_steps: 5
+  denoise_steps: 5
+
+logging:
+  best_rho_csv_path: "outputs/sumo_ryl_best_rho_history.csv"
+  initial_population_path: "outputs/sumo_ryl_4000_initial_population.pkl"
+
+q_provider:
+  class_path: "src.q.sumo_ryl_q:SumoRylQProvider"
+  kwargs:
+    # 生成 Q 时仿真不用 DQN（只用 A*），因此这里只需要知道车辆数量用于传入 policies=[None]*N
+    num_car: 4000
+    # Q 缓存路径（可选）。若存在则会直接加载，避免每次都跑一遍 SUMO。
+    cache_path: "outputs/q_sumo_ryl.pt"
+    # 是否强制重算 Q
+    force_recompute: false
+
+environment:
+  class_path: "src.environments.sumo_ryl:SumoRylEnvironment"
+  kwargs:
+    # --- SUMO 基础配置 ---
+    sumo_config: "maps/ChongQing-114_4700.sumocfg"
+    net_file: "maps/ChongQing-114.net.xml"
+    route_file: "maps/ChongQing_NEW2023-07-01.rou.xml"
+    sumo_use_gui: false
+    # sumo_binary: "sumo"   # 可选：显式指定 sumo 可执行文件；不填则用 sumolib.checkBinary
+
+    # --- 仿真控制 ---
+    end_tick: 1800
+    update_interval: 18
+    sample_interval: 18
+
+    # 训练好的 DQN/扩散模型平时存 CPU；但“使用 DQN 做决策”时临时搬到 GPU（用完再搬回 CPU）
+    move_policies_to_device: false
+    policy_device: "cpu"   # auto/cpu/cuda/cuda:0...
+
+    # --- vehicle 绑定方式（三选一，优先级：controlled_vehicle_ids > route_file > 运行时 vehicle.getIDList）---
+    # controlled_vehicle_ids:
+    #   - "veh0"
+    #   - "veh1"
+
+    # --- TraCI 连接标签（并行跑多个 SUMO 时可用）---
+    # traci_label: "sumo_env_0"
+
+    # --- 额外 SUMO 参数（可选）---
+    extra_sumo_args:
+      # - "--seed"
+      # - "0"
+      # 注意：环境内部默认已经设置了 "--no-step-log true" 与 "--no-warnings true"
+      # 如果你要覆盖它们，请在这里显式设置对应 option（且不要重复写同一个 option）
+
+dqn_module:
+  class_path: "src.dqn.sumo_ryl_dqn:SumoRylDqnModule"
+  kwargs:
+    # 动作空间大小（道路数）
+    num_road: 114
+    # 状态特征维度：默认 2 -> [distance_to_dest, queue_length]
+    input_dim: 2
+    hidden_dim: 128
+    device: "cuda"
+    epochs: 10
+    batch_size: 32
+    lr: 0.001
+    min_experiences: 5
+    # 奖励填充策略：to=使用 rewards[car_idx, action_idx]；from=尝试用 edge_id->index
+    reward_fill: "to"
+    # 环境调用 policy.select_action 时使用的 epsilon（可选）
+    epsilon: 0.0
+
+diffusion_model:
+  class_path: "src.diffusion.sumo_ryl_diffusion:SumoRylDiffusionModel"
+  kwargs:
+    # 生成 R 的形状为 [num_car, num_road]，其中 num_car=N，num_road 由 net_file 决定（例：114）
+    num_car: 4000
+    device: "cuda"
+    sampler: "ddim"            # "ddim"（推荐）或 "ddpm"
+    schedule_type: "cosine"    # "linear" 或 "cosine"
+    num_timesteps: 1000
+    inference_steps: 50        # DDIM 推理步数（越小越快）
+    ddim_eta: 0.0
+
+    # 训练参数（5.1 步用种群训练扩散）
+    num_epochs: 50
+    batch_size: 32
+    lr: 0.0001
+
+elite_selector:
+  class_path: "src.evolution.temperature_selection:TemperatureEliteSelector"
+  kwargs:
+    # 参考 run_dqn_es.py：probs = softmax(temperature * rho)
+    temperature: 1.5
+    # 是否放回采样（与 torch.multinomial 的 replacement 一致）
+    replacement: false
+
+metric:
+  class_path: "src.metrics.sumo_ryl_metric:SumoRylMetric"
+  kwargs:
+    # MSE 越小越好 -> ρ 越大越好
+    # inv1p: rho=1/(1+mse)（默认，稳定）
+    transform: "inv1p"
+    # 可选：如果你希望 rho 更敏感，可用 inv 或 exp
+    # transform: "inv"
+    # transform: "exp"
+    eps: 1.0e-8
+
+parallel_executor:
+  class_path: "src.parallel.ray_executor:RayExecutor"
+  kwargs:
+    # Ray 初始化参数（等价于 ray.init(...)）
+    # 说明：
+    # - num_cpus/num_gpus：Ray 资源上限（用于调度）；一般设为机器可用资源
+    # - object_store_memory：对象存储（Plasma）大小，单位 bytes（过大/过小都会影响性能）
+    ray_init_kwargs:
+      num_cpus: 50
+      num_gpus: 2
+      object_store_memory: 322122547200
+
+    # 按“任务名”（runner.py 里的函数名）为 Ray task 配置资源：
+    # - build_initial_individual：3-4 步构建初始个体（会跑仿真 + 扩散生成 + DQN 训练 + 再仿真）
+    # - mutate_one：5.3 步对精英个体做变异（同样包含扩散与 DQN 训练/仿真）
+    #
+    # 注意：如果你的 dqn_module/diffusion_model 使用 device=cuda，则这里需要为任务分配 num_gpus>0，
+    # 否则 Ray worker 的 CUDA 可能不可见，导致 torch 报错。
+    task_options_by_name:
+      build_initial_individual:
+        num_cpus: 2.5
+        num_gpus: 0.1
+      mutate_one:
+        num_cpus: 2.5
+        num_gpus: 0.1
+
+    # 没有在 task_options_by_name 中单独配置的任务，将使用默认 task options
+    default_task_options:
+      num_cpus: 1
+
+    show_progress: true
+    desc: "RayExecutor"
+    max_updates: 20
+
+extra:
+  note: "sumo_ryl 配置示例"
+
