@@ -23,27 +23,7 @@ MASDiff 文档
    framework/evolutionary_strategy
    framework/offline_rl
 
-.. toctree::
-   :maxdepth: 3
-   :caption: 场景文档
 
-   scenarios/traffic_sumo
-   scenarios/smac
-   scenarios/mpe
-
-.. toctree::
-   :maxdepth: 2
-   :caption: 实验结果
-
-   experiments/rq1_alignment
-   experiments/rq2_counterfactual
-   experiments/rq3_scalability
-
-.. toctree::
-   :maxdepth: 1
-   :caption: 参考资料
-
-   bibliography
 
 索引
 ----
