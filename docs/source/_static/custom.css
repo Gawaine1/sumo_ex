@@ -1,0 +1,56 @@
+/* MASDiff Documentation - Custom Styles */
+
+/* Wider content area */
+.wy-nav-content {
+    max-width: 1000px;
+}
+
+/* Mermaid diagram centering */
+.mermaid {
+    text-align: center;
+    margin: 1.5em 0;
+}
+
+/* Math display */
+.math {
+    overflow-x: auto;
+}
+
+/* Table improvements */
+table.docutils {
+    width: 100%;
+    font-size: 0.9em;
+}
+
+table.docutils th {
+    background-color: #2980b9;
+    color: white;
+    padding: 6px 10px;
+}
+
+table.docutils td {
+    padding: 5px 10px;
+    vertical-align: top;
+}
+
+table.docutils tr:nth-child(even) td {
+    background-color: #f5f5f5;
+}
+
+/* Admonition (note/warning boxes) */
+.rst-content .note .admonition-title {
+    background: #6ab0de;
+}
+
+/* Code blocks */
+.highlight pre {
+    font-size: 0.85em;
+    line-height: 1.5;
+}
+
+/* Step headings */
+h3 {
+    border-left: 4px solid #2980b9;
+    padding-left: 10px;
+    margin-top: 1.5em;
+}
