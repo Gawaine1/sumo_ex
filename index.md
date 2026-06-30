@@ -1,12 +1,10 @@
-# Linux 体系和编程 — 实验指导
+# MASDiff 项目文档
 
-欢迎来到 **Linux 体系和编程** 课程。本文档是课程的配套实验指导材料，围绕"虚拟 LED 字符设备驱动"项目展开，从环境搭建到内核驱动开发，循序渐进地帮助学生掌握 Linux 系统编程的核心概念。
+欢迎来到 **MASDiff** 项目文档。MASDiff 是一个围绕"**多智能体仿真 + DQN 策略训练 + 条件扩散奖励生成 + 进化迭代优化**"组织起来的实验框架。
 
 ```{toctree}
 :maxdepth: 2
 :caption: 目录
 
-lesson01-setup
-lesson02-vled
 evolution-analysis
 ```
