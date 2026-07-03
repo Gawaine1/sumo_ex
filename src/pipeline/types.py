@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from typing import List
 
 @dataclass
 class Individual:
@@ -23,6 +24,6 @@ class Individual:
     policies: list[Any] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
-
-Population = list[Individual]
+from typing import List
+Population = List[Individual]
 

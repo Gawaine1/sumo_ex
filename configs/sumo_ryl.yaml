@@ -6,7 +6,7 @@ seed: 42
 algorithm:
   M: 100
   N: 1557
-  K: 1
+  K: 300
 
 elite:
   elite_count: 20
@@ -126,7 +126,7 @@ parallel_executor:
     # - object_store_memory：对象存储（Plasma）大小，单位 bytes（过大/过小都会影响性能）
     ray_init_kwargs:
       num_cpus: 50
-      num_gpus: 2
+      num_gpus: 3
       object_store_memory: 322122547200
 
     # 按“任务名”（runner.py 里的函数名）为 Ray task 配置资源：
@@ -138,10 +138,10 @@ parallel_executor:
     task_options_by_name:
       build_initial_individual:
         num_cpus: 2.5
-        num_gpus: 0.1
+        num_gpus: 0.3
       mutate_one:
         num_cpus: 2.5
-        num_gpus: 0.1
+        num_gpus: 0.3
 
     # 没有在 task_options_by_name 中单独配置的任务，将使用默认 task options
     default_task_options:
