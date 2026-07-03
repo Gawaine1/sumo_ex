@@ -1,0 +1,69 @@
+# 这是“示例配置文件 default.yaml”（没有实际意义），用于展示：
+# - 每套模块一个 yaml（包含所有可自定义模块）
+# - 每个模块用 class_path 指向用户自定义实现类，并可传入 kwargs
+
+seed: 0
+
+algorithm:
+  M: 4        # 种群规模
+  N: 2        # 智能体数量
+  K: 3        # 进化迭代次数
+
+elite:
+  elite_count: 2
+
+truncated_diffusion:
+  add_noise_steps: 2
+  denoise_steps: 2
+
+logging:
+  # 每次进化迭代（k=1..K）在 5.6 步把“当前种群最优ρ”追加写到该 CSV
+  best_rho_csv_path: "outputs/best_rho_history.csv"
+  # 3~4 步构建的初始种群缓存文件；如果文件已存在则会直接读取
+  initial_population_path: "outputs/initial_population.pkl"
+
+# -----------------------------
+# 可插拔模块：用户自定义实现
+# -----------------------------
+q_provider:
+  class_path: "your_pkg.q_provider:YourQProvider"
+  kwargs: {}
+
+environment:
+  class_path: "your_pkg.envs:YourEnvironment"
+  kwargs:
+    # 这里可以放环境参数（示例）
+    episode_len: 128
+    feature_dim: 16
+
+dqn_module:
+  class_path: "your_pkg.dqn:YourDqnModule"
+  kwargs:
+    # 这里可以放 DQN 训练参数（示例）
+    lr: 0.0003
+    batch_size: 256
+
+diffusion_model:
+  class_path: "your_pkg.diffusion:YourDiffusionModel"
+  kwargs:
+    # 这里可以放扩散模型参数（示例）
+    hidden_size: 256
+
+elite_selector:
+  class_path: "your_pkg.evolution:YourEliteSelector"
+  kwargs:
+    # 这里可以放选择策略参数（示例）
+    method: "topk"
+
+metric:
+  class_path: "your_pkg.metrics:YourMetric"
+  kwargs: {}
+
+# 并行执行器：框架内置一个默认串行执行器（可替换成线程池/进程池等）
+parallel_executor:
+  class_path: "src.parallel.serial:SerialExecutor"
+  kwargs: {}
+
+extra:
+  note: "示例字段：框架会原样保留，可供用户模块自行读取使用"
+
